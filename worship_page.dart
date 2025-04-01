@@ -100,7 +100,7 @@ class _WorshipPageState extends State<WorshipPage> {
     contentLoader.map((event) => false),
   ]).startWith(true).shareReplay(maxSize: 1);
 
-  late Stream<List<WorshipContent>> contents$ = createContentsStream();
+  late ReplayStream<List<WorshipContent>> contents$ = createContentsStream();
 
   List<BuildContext> expansionContextes = [];
 
@@ -116,6 +116,8 @@ class _WorshipPageState extends State<WorshipPage> {
   List<int> timepoints = [];
   List<int> trackLengths = [];
   List<int> timeEnds = [];
+  Map<int, String>? soloMap = {};
+  final soloAudio = AudioPlayer();
 
   late var onAudioEnded = audio.processingStateStream
       .where((state) => state == ProcessingState.completed);
@@ -142,20 +144,36 @@ class _WorshipPageState extends State<WorshipPage> {
   final onSoloPauseClick = PublishSubject<int>();
   late final onSoloEnd = MergeStream<void>([
     onSoloPlayClick.switchMap((index) {
-      var seeked = Completer<void>();
-      seekAudio(Duration(milliseconds: timepoints[index]), () {
-        audio.play();
-        seeked.complete();
-      });
+      var content = contents$.values.first[index];
+      if (soloMap != null && soloMap!.containsKey(content.id)) {
+        audio.pause();
+        var soloSoundtrack = soloMap![content.id]!;
 
-      return seeked.future.then((_) {
-        return audio
-            .createPositionStream(
-              minPeriod: const Duration(milliseconds: 1),
-              maxPeriod: const Duration(milliseconds: 1),
-            )
-            .firstWhere((pos) => pos.inMilliseconds + 100 >= timeEnds[index]);
-      }).asStream();
+        return soloAudio
+            .setAudioSource(AudioSource.uri(Uri.parse(soloSoundtrack)))
+            .then((r) {
+          soloAudio.play();
+          return soloAudio.processingStateStream.firstWhere((element) {
+            return element == ProcessingState.completed;
+          });
+        }).asStream();
+      } else {
+        soloAudio.pause();
+        var seeked = Completer<void>();
+        seekAudio(Duration(milliseconds: timepoints[index]), () {
+          audio.play();
+          seeked.complete();
+        });
+
+        return seeked.future.then((_) {
+          return audio
+              .createPositionStream(
+                minPeriod: const Duration(milliseconds: 1),
+                maxPeriod: const Duration(milliseconds: 1),
+              )
+              .firstWhere((pos) => pos.inMilliseconds + 100 >= timeEnds[index]);
+        }).asStream();
+      }
     }),
     onStopClick,
   ]).publish();
@@ -496,6 +514,7 @@ class _WorshipPageState extends State<WorshipPage> {
                     (acc, dur) =>
                         (t: acc.t + dur, arr: acc.arr..add(acc.t + dur)),
                   ).arr;
+                  soloMap = data.soloMap;
 
                   return StreamBuilder(
                       stream: CombineLatestStream.combine4(
@@ -895,7 +914,7 @@ class _WorshipPageState extends State<WorshipPage> {
     );
   }
 
-  Stream<List<WorshipContent>> createContentsStream() {
+  ReplayStream<List<WorshipContent>> createContentsStream() {
     BehaviorSubject<List<WorshipContent>> contents = BehaviorSubject.seeded([]);
 
     var sub1 = contentLoader.listen((event) {
@@ -981,21 +1000,27 @@ class _WorshipPageState extends State<WorshipPage> {
                   children: [
                     const SizedBox(width: kMargin / 2),
                     StreamToWidget(
-                      Rx.combineLatest3(
+                      Rx.combineLatest4(
                         running,
                         soloing$,
                         audio.playingStream,
-                        (running, soloing, playing) {
+                        soloAudio.playingStream,
+                        (running, soloing, playing, soloAudioPlaying) {
                           return (
                             running: running,
                             soloing: soloing,
-                            playing: playing
+                            playing: playing,
+                            soloAudioPlaying: soloAudioPlaying,
                           );
                         },
                       ),
                       converter: (data) {
                         bool isActive = data.soloing == index;
                         bool isPaused = isActive && !data.playing;
+
+                        if (soloMap != null && soloMap![content.id] != null) {
+                          isPaused = isActive && !data.soloAudioPlaying;
+                        }
 
                         if (data.running && data.soloing == null) {
                           return const SizedBox();
@@ -1112,6 +1137,26 @@ class _WorshipPageState extends State<WorshipPage> {
     List<Song> songs,
     List<int> trackLengths,
   ) {
+    var isOnSoloMap = soloMap != null && soloMap![content.id] != null;
+
+    var active = soloing$.switchMap((soloIndex) {
+      if (isOnSoloMap && soloIndex == index) {
+        return Stream.value(true).shareReplay(maxSize: 1);
+      } else {
+        return audioPos
+            .map((t) => t > timepoints[index] && t < timeEnds[index])
+            .distinct();
+      }
+    });
+    var currentTime = soloing$.switchMap((soloIndex) {
+      if (isOnSoloMap && soloIndex == index) {
+        return soloAudio.positionStream.map((pos) => pos.inMilliseconds);
+      } else {
+        return audioPos.map(
+            (pos) => (pos - timepoints[index]).clamp(0, trackLengths[index]));
+      }
+    });
+
     if (content.type == "song") {
       int songId = (content.data as SongData).songId;
       Song? song = songs.firstWhereOrNull((s) => s.id == songId);
@@ -1127,11 +1172,8 @@ class _WorshipPageState extends State<WorshipPage> {
         duration: trackLengths.elementAtOrNull(index) ?? 0,
         introDuration: song.introDuration,
         running: running,
-        currentTime: audioPos.map(
-            (pos) => (pos - timepoints[index]).clamp(0, trackLengths[index])),
-        active: audioPos
-            .map((t) => t > timepoints[index] && t < timeEnds[index])
-            .distinct(),
+        currentTime: currentTime,
+        active: active,
       );
     } else if (content.type == "scripture") {
       return ScriptureContent(
@@ -1139,11 +1181,8 @@ class _WorshipPageState extends State<WorshipPage> {
         scripture: content.data as Scripture,
         running: running,
         duration: trackLengths.elementAtOrNull(index) ?? 0,
-        time: audioPos.map(
-            (pos) => (pos - timepoints[index]).clamp(0, trackLengths[index])),
-        active: audioPos
-            .map((t) => t > timepoints[index] && t < timeEnds[index])
-            .distinct(),
+        time: currentTime,
+        active: active,
       );
     } else if (content.type == "prayer") {
       return PrayerContent(
@@ -1384,6 +1423,7 @@ class _WorshipPageState extends State<WorshipPage> {
       sub.cancel();
     }
     audio.dispose();
+    soloAudio.dispose();
     super.dispose();
   }
 }
