@@ -58,12 +58,15 @@ class _WorshipPageState extends State<WorshipPage> {
 
   final onRetryClick = PublishSubject<bool>();
   late var onDeleteContent = PublishSubject<WorshipContent>();
+  late var onDeleteGroup = PublishSubject<WorshipGroup>();
   late var onAddContent = PublishSubject<WorshipContent>();
+  late var onAddGroup = PublishSubject<WorshipGroup>();
   late var onAddSong = PublishSubject<Song>();
   final onSortContent = PublishSubject<({int oldIndex, int newIndex})>();
 
   final onEditClick = PublishSubject<bool>();
   final onDoneClick = PublishSubject<bool>();
+  late var onChangesSaved$ = createOnChangesSaved();
 
   late var editing = MergeStream([
     onEditClick.map((_) => true),
@@ -88,8 +91,8 @@ class _WorshipPageState extends State<WorshipPage> {
       .where((success) => success)
       .publish();
 
-  late var contentLoader = MergeStream([onRetryClick, onDoneClick])
-      .startWith(true)
+  late var contentLoader = MergeStream<void>([onRetryClick, onChangesSaved$])
+      .startWith(null)
       .switchMap((_) =>
           WorshipService.getWorshipContennts(widget.worship.id).asStream())
       .shareReplay(maxSize: 1);
@@ -347,10 +350,6 @@ class _WorshipPageState extends State<WorshipPage> {
       });
     });
 
-    var deleteClick = onDeleteContent.listen((content) {
-      WorshipService.removeContent(widget.worship.id, content.id);
-    });
-
     var doneClick = onDoneClick.listen((value) {
       widget.worship.title = titleController.value.text;
       titleNotifier.value = titleController.value.text;
@@ -362,12 +361,12 @@ class _WorshipPageState extends State<WorshipPage> {
     });
 
     subs.addAll([
+      onChangesSaved$.connect(),
       startAudio,
       pauseAudio,
       nextPrevBtns,
       sendSocketMessage,
       onPlayMessage,
-      deleteClick,
       doneClick,
 
       // Note: must listen early in order to capture participants before countdown
@@ -585,6 +584,27 @@ class _WorshipPageState extends State<WorshipPage> {
                 mainAxisAlignment: MainAxisAlignment.end,
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
+                  ElevatedButton(
+                    onPressed: () => onAddGroup.add(WorshipGroup(
+                      name: "New Group",
+                      count: 0,
+                    )),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.deepPurple,
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(7)),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: kMargin, vertical: kMargin / 2),
+                    ),
+                    child: const Row(
+                      children: [
+                        Icon(Icons.workspaces, color: Colors.white),
+                        SizedBox(width: kMargin / 2),
+                        Text("Add group"),
+                      ],
+                    ),
+                  ),
                   ElevatedButton(
                     onPressed: () {
                       showModalBottomSheet(
@@ -922,8 +942,43 @@ class _WorshipPageState extends State<WorshipPage> {
     });
 
     var sub2 = onDeleteContent.listen((content) {
+      var mergedlist = getGroupsAndContentsAsFlattend();
+      var contentIndex = mergedlist.indexOf(content);
+
+      var associatedGroup = mergedlist
+          .take(contentIndex + 1)
+          .lastWhereOrNull((e) => e is WorshipGroup);
+      if (associatedGroup != null) {
+        (associatedGroup as WorshipGroup).count--;
+      }
       contents.add(contents.value..remove(content));
       WorshipService.removeContent(widget.worship.id, content.id);
+    });
+
+    var sub2_2 = onDeleteGroup.listen((group) {
+      var mergedlist = getGroupsAndContentsAsFlattend();
+      var groupIndex = mergedlist.indexOf(group);
+
+      // Find a group directly behind the to-be-deleted group
+      var previousGroup = mergedlist.lastWhereIndexedOrNull((index, element) {
+        return element is WorshipGroup && index < groupIndex;
+      }) as WorshipGroup?;
+
+      // Find a group directly ahead of the to-be-deleted group
+      var nextGroup = mergedlist.firstWhereIndexedOrNull((index, element) {
+        return element is WorshipGroup && index > groupIndex;
+      }) as WorshipGroup?;
+
+      if (previousGroup != null) {
+        previousGroup.count += group.count;
+      } else if (nextGroup != null) {
+        nextGroup.count += group.count;
+      } else {
+        // Only reached if there are groups in worship after deletion
+      }
+
+      widget.worship.groups?.remove(group);
+      contents.add(contents.value);
     });
 
     var sub3 = onSortContent.listen((event) {
@@ -933,28 +988,57 @@ class _WorshipPageState extends State<WorshipPage> {
         newIndex -= 1;
       }
 
-      WorshipContent old = contents.value[oldIndex];
-      contents.add(
-        contents.value
+      // mergedlist is a List<(WorshipGroup|WorshipContent)>
+      var mergedlist = getGroupsAndContentsAsFlattend();
+
+      var old = mergedlist[oldIndex];
+      mergedlist.add(
+        mergedlist
           ..removeAt(event.oldIndex)
           ..insert(newIndex, old),
       );
 
-      WorshipService.order(
-        widget.worship.id,
-        contents.value.map((c) => c.id).toList(),
-      );
+      var hasGroups = mergedlist.any((e) => e is WorshipGroup);
+      if (hasGroups) {
+        var contentsBeforeFirstGroup =
+            mergedlist.takeWhile((e) => e is WorshipContent).toList();
+        if (contentsBeforeFirstGroup.isNotEmpty) {
+          // shift all contents before the first group to after the first group
+          mergedlist.removeRange(0, contentsBeforeFirstGroup.length);
+          mergedlist.insertAll(1, contentsBeforeFirstGroup);
+        }
+
+        for (var (index, item) in mergedlist.indexed) {
+          if (item is WorshipGroup) {
+            item.count = mergedlist
+                .skip(index + 1)
+                .takeWhile((value) => value is WorshipContent)
+                .length;
+          }
+        }
+      }
+
+      widget.worship.groups = mergedlist.whereType<WorshipGroup>().toList();
+      contents.value = mergedlist.whereType<WorshipContent>().toList();
     });
 
     var sub4 = onAddContent.listen((content) {
+      widget.worship.groups?.lastOrNull?.count++;
       contents.add(contents.value..add(content));
+    });
+
+    var sub5 = onAddGroup.listen((group) {
+      widget.worship.groups?.add(group);
+      contents.add(contents.value);
     });
 
     return contents.doOnCancel(() {
       sub1.cancel();
       sub2.cancel();
+      sub2_2.cancel();
       sub3.cancel();
       sub4.cancel();
+      sub5.cancel();
     }).shareReplay(maxSize: 1);
   }
 
@@ -980,101 +1064,136 @@ class _WorshipPageState extends State<WorshipPage> {
       },
     );
 
-    return ExpansionPanelList(
+    buildContent(WorshipContent content, int contentIndex) {
+      return ExpansionPanel(
+        canTapOnHeader: true,
+        isExpanded: openIndex == contentIndex,
+        headerBuilder: (context, isExpanded) {
+          // HACK: this is to assign a context for scrolling
+          return Builder(builder: (context) {
+            panelContextes.add(context);
+            return Padding(
+              padding: const EdgeInsets.symmetric(vertical: kMargin),
+              child: Row(
+                children: [
+                  const SizedBox(width: kMargin / 2),
+                  StreamToWidget(
+                    Rx.combineLatest4(
+                      running,
+                      soloing$,
+                      audio.playingStream,
+                      soloAudio.playingStream,
+                      (running, soloing, playing, soloAudioPlaying) {
+                        return (
+                          running: running,
+                          soloing: soloing,
+                          playing: playing,
+                          soloAudioPlaying: soloAudioPlaying,
+                        );
+                      },
+                    ),
+                    converter: (data) {
+                      bool isActive = data.soloing == contentIndex;
+                      bool isPaused = isActive && !data.playing;
+
+                      if (soloMap != null && soloMap![content.id] != null) {
+                        isPaused = isActive && !data.soloAudioPlaying;
+                      }
+
+                      if (data.running && data.soloing == null) {
+                        return const SizedBox();
+                      }
+
+                      return FloatingActionButton.small(
+                          shape: const RoundedRectangleBorder(
+                            borderRadius: BorderRadius.all(Radius.circular(5)),
+                          ),
+                          backgroundColor: Colors.black,
+                          foregroundColor: Colors.white,
+                          elevation: 0,
+                          onPressed: () {
+                            if (!isActive) {
+                              onSoloPlayClick.add(contentIndex);
+                            } else if (isPaused) {
+                              audio.play();
+                            } else {
+                              onSoloPauseClick.add(contentIndex);
+                            }
+                          },
+                          child: Icon(
+                            isActive && !isPaused
+                                ? Icons.pause
+                                : Icons.play_arrow,
+                          ));
+                    },
+                  ),
+                  const SizedBox(width: kMargin / 2),
+                  Icon(convertTypeToIcon(content.type), size: 16),
+                  const SizedBox(width: kMargin),
+                  Expanded(
+                    child: Text(content.title),
+                  ),
+                ],
+              ),
+            );
+          });
+        },
+        body: buildContentBody(
+          context,
+          content,
+          contentIndex,
+          songs,
+          trackLengths,
+        ),
+      );
+    }
+
+    var widgets = <Widget>[];
+    var contentIndex = 0;
+
+    for (var group in widget.worship.groups ?? <WorshipGroup>[]) {
+      widgets.add(Container(
+        width: double.infinity,
+        color: Colors.grey.shade200,
+        padding:
+            const EdgeInsets.symmetric(horizontal: kMargin, vertical: kMargin),
+        child: Text(
+          group.name,
+          style: const TextStyle(fontWeight: FontWeight.bold),
+        ),
+      ));
+
+      var panelList = <ExpansionPanel>[];
+      for (var i = 1;
+          i <= group.count && contentIndex < contents.length;
+          i++, contentIndex++) {
+        var content = contents[contentIndex];
+        panelList.add(buildContent(content, contentIndex));
+      }
+
+      widgets.add(ExpansionPanelList(
+        expandedHeaderPadding: EdgeInsets.zero,
+        animationDuration: const Duration(milliseconds: 400),
+        expansionCallback: (panelIndex, isExpanded) {
+          expansionCallbacked.add((panelIndex, isExpanded));
+        },
+        children: panelList,
+      ));
+    }
+
+    widgets.add(ExpansionPanelList(
       expandedHeaderPadding: EdgeInsets.zero,
       animationDuration: const Duration(milliseconds: 400),
       expansionCallback: (panelIndex, isExpanded) {
         expansionCallbacked.add((panelIndex, isExpanded));
       },
-      children: contents.mapIndexed((index, content) {
-        return ExpansionPanel(
-          canTapOnHeader: true,
-          isExpanded: openIndex == index,
-          headerBuilder: (context, isExpanded) {
-            // HACK: this is to assign a context for scrolling
-            return Builder(builder: (context) {
-              panelContextes.add(context);
-              return Padding(
-                padding: const EdgeInsets.symmetric(vertical: kMargin),
-                child: Row(
-                  children: [
-                    const SizedBox(width: kMargin / 2),
-                    StreamToWidget(
-                      Rx.combineLatest4(
-                        running,
-                        soloing$,
-                        audio.playingStream,
-                        soloAudio.playingStream,
-                        (running, soloing, playing, soloAudioPlaying) {
-                          return (
-                            running: running,
-                            soloing: soloing,
-                            playing: playing,
-                            soloAudioPlaying: soloAudioPlaying,
-                          );
-                        },
-                      ),
-                      converter: (data) {
-                        bool isActive = data.soloing == index;
-                        bool isPaused = isActive && !data.playing;
+      children: [
+        for (; contentIndex < contents.length; contentIndex++)
+          buildContent(contents[contentIndex], contentIndex),
+      ],
+    ));
 
-                        if (soloMap != null && soloMap![content.id] != null) {
-                          isPaused = isActive && !data.soloAudioPlaying;
-                        }
-
-                        if (data.running && data.soloing == null) {
-                          return const SizedBox();
-                        }
-
-                        return FloatingActionButton.small(
-                            shape: const RoundedRectangleBorder(
-                              borderRadius:
-                                  BorderRadius.all(Radius.circular(5)),
-                            ),
-                            backgroundColor: Colors.black,
-                            foregroundColor: Colors.white,
-                            elevation: 0,
-                            onPressed: () {
-                              if (!isActive) {
-                                onSoloPlayClick.add(index);
-                              } else if (isPaused) {
-                                audio.play();
-                              } else {
-                                onSoloPauseClick.add(index);
-                              }
-                            },
-                            child: Icon(
-                              isActive && !isPaused
-                                  ? Icons.pause
-                                  : Icons.play_arrow,
-                            ));
-                      },
-                    ),
-                    const SizedBox(width: kMargin / 2),
-                    Icon(convertTypeToIcon(content.type), size: 16),
-                    const SizedBox(width: kMargin),
-                    Expanded(
-                      child: Text(
-                        content.title,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                  ],
-                ),
-              );
-            });
-          },
-          body: buildContentBody(
-            context,
-            content,
-            index,
-            songs,
-            trackLengths,
-          ),
-        );
-      }).toList(),
-    );
+    return Column(children: widgets);
   }
 
   Widget editContentList(
@@ -1082,15 +1201,10 @@ class _WorshipPageState extends State<WorshipPage> {
     List<Song> songs,
     int openIndex,
   ) {
-    return ReorderableListView.builder(
-      shrinkWrap: true,
-      physics: const NeverScrollableScrollPhysics(),
-      itemCount: contents.length,
-      onReorder: (oldIndex, newIndex) =>
-          onSortContent.add((oldIndex: oldIndex, newIndex: newIndex)),
-      itemBuilder: (context, index) {
-        var content = contents[index];
+    Widget Function(int dragIndex) buildContent(int contentIndex) {
+      var content = contents[contentIndex];
 
+      return (int dragIndex) {
         return Padding(
           key: ValueKey(content),
           padding: const EdgeInsets.symmetric(vertical: kMargin / 3),
@@ -1103,11 +1217,7 @@ class _WorshipPageState extends State<WorshipPage> {
               Icon(convertTypeToIcon(content.type), size: 16),
               const SizedBox(width: kMargin),
               Expanded(
-                child: Text(
-                  content.title,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
+                child: Text(content.title),
               ),
               const SizedBox(width: kMargin),
               if (content.type == "song")
@@ -1117,7 +1227,7 @@ class _WorshipPageState extends State<WorshipPage> {
                   icon: const Icon(Icons.piano),
                 ),
               ReorderableDragStartListener(
-                index: index,
+                index: dragIndex,
                 child: IconButton(
                   onPressed: () {},
                   icon: const Icon(Icons.drag_indicator),
@@ -1126,6 +1236,69 @@ class _WorshipPageState extends State<WorshipPage> {
             ],
           ),
         );
+      };
+    }
+
+    var widgets = <Widget Function(int dragIndex)>[];
+    var contentIndex = 0;
+
+    for (var group in widget.worship.groups ?? <WorshipGroup>[]) {
+      widgets.add((dragIndex) {
+        var controller = TextEditingController(
+          text: group.name,
+        );
+
+        controller.addListener(() {
+          group.name = controller.text;
+        });
+
+        return Container(
+          key: ValueKey(group),
+          width: double.infinity,
+          color: Colors.grey.shade200,
+          padding: const EdgeInsets.symmetric(vertical: kMargin / 3),
+          child: Row(
+            children: [
+              IconButton(
+                onPressed: () => onDeleteGroup.add(group),
+                icon: const Icon(Icons.delete, color: Colors.red),
+              ),
+              Expanded(
+                child: TextFormField(
+                  controller: controller,
+                ),
+              ),
+              ReorderableDragStartListener(
+                index: dragIndex,
+                child: IconButton(
+                  onPressed: () {},
+                  icon: const Icon(Icons.drag_indicator),
+                ),
+              )
+            ],
+          ),
+        );
+      });
+
+      for (var i = 1;
+          i <= group.count && contentIndex < contents.length;
+          i++, contentIndex++) {
+        widgets.add(buildContent(contentIndex));
+      }
+    }
+
+    for (; contentIndex < contents.length; contentIndex++) {
+      widgets.add(buildContent(contentIndex));
+    }
+
+    return ReorderableListView.builder(
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      itemCount: widgets.length,
+      onReorder: (oldIndex, newIndex) =>
+          onSortContent.add((oldIndex: oldIndex, newIndex: newIndex)),
+      itemBuilder: (context, index) {
+        return widgets[index](index);
       },
     );
   }
@@ -1413,6 +1586,38 @@ class _WorshipPageState extends State<WorshipPage> {
         content: Text("Failed to change track"),
       ));
     }
+  }
+
+  /// Returns a broadcast stream that emits when the changes are saved
+  /// onDoneClick emits when the user presses "Done", whereas this stream emits when the changes have actually been commited to the API
+  PublishConnectableStream<void> createOnChangesSaved() {
+    return onDoneClick.switchMap((event) {
+      return WorshipService.orderV2(
+        widget.worship.id,
+        contents$.values.last.map((e) => e.id).toList(),
+        widget.worship.groups ?? <WorshipGroup>[],
+      ).asStream();
+    }).publish();
+  }
+
+  /// Assumes contents$ has emitted at least one value
+  /// Returns a List<(WorshipGroup|WorshipContent)>
+  List<Object> getGroupsAndContentsAsFlattend() {
+    var contents = contents$.values.last;
+    // mergedlist is a List<(WorshipGroup|WorshipContent)>
+    int contentIndex = 0;
+    var mergedlist = [
+      for (var g in widget.worship.groups ?? <WorshipGroup>[]) ...[
+        g,
+        for (var i = 1;
+            i <= g.count && contentIndex < contents.length;
+            i++, contentIndex++)
+          contents[contentIndex]
+      ],
+      for (; contentIndex < contents.length; contentIndex++)
+        contents[contentIndex],
+    ];
+    return mergedlist;
   }
 
   @override
